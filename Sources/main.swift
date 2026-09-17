@@ -1,12 +1,152 @@
 import AppKit
 import Foundation
 import IOKit.pwr_mgt
+import SQLite3
 
 private enum PreferenceKey {
     static let sessionIsActive = "sessionIsActive"
     static let sessionIsIndefinite = "sessionIsIndefinite"
     static let sessionEndDate = "sessionEndDate"
     static let preventScreenSaver = "preventScreenSaver"
+    static let codexCompletionDingEnabled = "codexCompletionDingEnabled"
+}
+
+private struct CodexTurn: Hashable {
+    let threadID: String
+    let turnID: String
+}
+
+private final class CodexCompletionMonitor {
+    private let queue = DispatchQueue(label: "com.andrewmcgrath.stayawake.codex-completion-monitor", qos: .utility)
+    private let sound = NSSound(contentsOfFile: "/System/Library/Sounds/Glass.aiff", byReference: true)
+    private var timer: DispatchSourceTimer?
+    private var seenTurns = Set<CodexTurn>()
+    private var hasBaseline = false
+
+    private var codexDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
+    }
+
+    func start() {
+        guard timer == nil else { return }
+
+        hasBaseline = false
+        seenTurns.removeAll()
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(500), leeway: .milliseconds(100))
+        timer.setEventHandler { [weak self] in
+            self?.poll()
+        }
+        self.timer = timer
+        timer.resume()
+    }
+
+    func stop() {
+        timer?.cancel()
+        timer = nil
+        hasBaseline = false
+        seenTurns.removeAll()
+    }
+
+    private func poll() {
+        guard let currentTurns = completedVisibleTurns() else { return }
+
+        guard hasBaseline else {
+            seenTurns = currentTurns
+            hasBaseline = true
+            return
+        }
+
+        let newTurnCount = currentTurns.subtracting(seenTurns).count
+        seenTurns = currentTurns
+        guard newTurnCount > 0 else { return }
+
+        for index in 0..<newTurnCount {
+            DispatchQueue.main.asyncAfter(deadline: .now() + (Double(index) * 0.7)) { [weak self] in
+                self?.sound?.stop()
+                self?.sound?.play()
+            }
+        }
+    }
+
+    private func completedVisibleTurns() -> Set<CodexTurn>? {
+        let statePath = codexDirectory.appendingPathComponent("state_5.sqlite").path
+        let historyPath = codexDirectory.appendingPathComponent("thread_history_1.sqlite").path
+
+        guard let visibleThreadIDs = queryStrings(
+            databasePath: statePath,
+            sql: "SELECT id FROM threads WHERE thread_source = 'user' AND preview <> ''"
+        ) else {
+            return nil
+        }
+
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(historyPath, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+              let database else {
+            sqlite3_close(database)
+            return nil
+        }
+        defer { sqlite3_close(database) }
+
+        sqlite3_busy_timeout(database, 500)
+
+        let sql = """
+            SELECT thread_id, turn_id
+              FROM thread_turns
+             WHERE status = 'completed'
+               AND completed_at IS NOT NULL
+            """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
+              let statement else {
+            sqlite3_finalize(statement)
+            return nil
+        }
+        defer { sqlite3_finalize(statement) }
+
+        var turns = Set<CodexTurn>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let threadCString = sqlite3_column_text(statement, 0),
+                  let turnCString = sqlite3_column_text(statement, 1) else {
+                continue
+            }
+
+            let threadID = String(cString: threadCString)
+            guard visibleThreadIDs.contains(threadID) else { continue }
+            turns.insert(CodexTurn(threadID: threadID, turnID: String(cString: turnCString)))
+        }
+
+        return turns
+    }
+
+    private func queryStrings(databasePath: String, sql: String) -> Set<String>? {
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(databasePath, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+              let database else {
+            sqlite3_close(database)
+            return nil
+        }
+        defer { sqlite3_close(database) }
+
+        sqlite3_busy_timeout(database, 500)
+
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
+              let statement else {
+            sqlite3_finalize(statement)
+            return nil
+        }
+        defer { sqlite3_finalize(statement) }
+
+        var values = Set<String>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let value = sqlite3_column_text(statement, 0) {
+                values.insert(String(cString: value))
+            }
+        }
+        return values
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -17,7 +157,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let indefiniteMenuItem = NSMenuItem(title: "Prevent Sleep Indefinitely", action: #selector(startIndefinitely), keyEquivalent: "")
     private let customMenuItem = NSMenuItem(title: "Prevent Sleep for Custom Hours…", action: #selector(promptForCustomHours), keyEquivalent: "")
     private let screenSaverMenuItem = NSMenuItem(title: "Also Prevent Screen Saver & Display Sleep", action: #selector(toggleScreenSaverPrevention), keyEquivalent: "")
+    private let codexDingMenuItem = NSMenuItem(title: "Ding When Codex Finishes", action: #selector(toggleCodexCompletionDing), keyEquivalent: "")
     private let stopMenuItem = NSMenuItem(title: "Allow Sleep Now", action: #selector(stopSession), keyEquivalent: "")
+    private let codexCompletionMonitor = CodexCompletionMonitor()
 
     private var systemSleepAssertionID = IOPMAssertionID(0)
     private var displaySleepAssertionID = IOPMAssertionID(0)
@@ -36,14 +178,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set { UserDefaults.standard.set(newValue, forKey: PreferenceKey.preventScreenSaver) }
     }
 
+    private var codexCompletionDingEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: PreferenceKey.codexCompletionDingEnabled) }
+        set { UserDefaults.standard.set(newValue, forKey: PreferenceKey.codexCompletionDingEnabled) }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        UserDefaults.standard.register(defaults: [PreferenceKey.codexCompletionDingEnabled: true])
         configureMenu()
+        if codexCompletionDingEnabled {
+            codexCompletionMonitor.start()
+        }
         restoreSavedSession()
         updateUI()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        codexCompletionMonitor.stop()
         releaseAllAssertions()
     }
 
@@ -55,7 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func configureMenu() {
         statusMenuItem.isEnabled = false
 
-        [indefiniteMenuItem, customMenuItem, screenSaverMenuItem, stopMenuItem].forEach {
+        [indefiniteMenuItem, customMenuItem, screenSaverMenuItem, codexDingMenuItem, stopMenuItem].forEach {
             $0.target = self
         }
 
@@ -66,6 +218,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(customMenuItem)
         menu.addItem(.separator())
         menu.addItem(screenSaverMenuItem)
+        menu.addItem(.separator())
+        menu.addItem(codexDingMenuItem)
         menu.addItem(.separator())
         menu.addItem(stopMenuItem)
         menu.addItem(.separator())
@@ -126,6 +280,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
+        updateUI()
+    }
+
+    @objc private func toggleCodexCompletionDing() {
+        codexCompletionDingEnabled.toggle()
+        if codexCompletionDingEnabled {
+            codexCompletionMonitor.start()
+        } else {
+            codexCompletionMonitor.stop()
+        }
         updateUI()
     }
 
@@ -348,6 +512,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         indefiniteMenuItem.state = active && sessionEndDate == nil ? .on : .off
         customMenuItem.state = active && sessionEndDate != nil ? .on : .off
         screenSaverMenuItem.state = preventsScreenSaver ? .on : .off
+        codexDingMenuItem.state = codexCompletionDingEnabled ? .on : .off
         stopMenuItem.isEnabled = active
 
         if !active {

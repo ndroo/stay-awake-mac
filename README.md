@@ -9,6 +9,7 @@ Stay Awake is a tiny native macOS menu-bar app that prevents your Mac from going
 - Keep your Mac awake indefinitely.
 - Keep it awake for a custom number of hours, including decimals such as `1.5`.
 - Optionally prevent the screen saver and display sleep during an active session.
+- Play a system ding whenever a user-visible Codex task finishes.
 - See the remaining time from the menu bar.
 - End a session immediately with **Allow Sleep Now**.
 - Restore an unfinished session when the app is reopened.
@@ -29,6 +30,7 @@ Click the moon icon in the menu bar, then choose:
 - **Prevent Sleep Indefinitely** to remain awake until you stop the session or quit the app.
 - **Prevent Sleep for Custom Hours…** to enter a duration.
 - **Also Prevent Screen Saver & Display Sleep** to keep the screen active during sleep-prevention sessions.
+- **Ding When Codex Finishes** to hear a system sound when any visible Codex task completes.
 - **Allow Sleep Now** to end the current session.
 
 The icon changes to a sun while a session is active.
@@ -36,6 +38,8 @@ The icon changes to a sun while a session is active.
 ## How it works
 
 Stay Awake uses Apple's IOKit power-management assertions. A normal session prevents idle system sleep while still allowing the display to turn off. The optional screen setting also prevents idle display sleep and periodically reports user activity to suppress the screen saver.
+
+When the Codex ding is enabled, Stay Awake reads Codex's local task-history databases in read-only mode and plays the macOS Glass sound when it sees a newly completed user task. Internal review tasks are ignored.
 
 The app does not simulate keyboard or mouse input, modify your permanent power settings, collect data, or connect to the internet.
 

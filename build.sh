@@ -25,6 +25,7 @@ for architecture in arm64 x86_64; do
         -module-cache-path "$module_cache_dir/$architecture" \
         -framework AppKit \
         -framework IOKit \
+        -lsqlite3 \
         "$project_dir/Sources/main.swift" \
         -o "$binary_dir/StayAwake-$architecture"
 done
